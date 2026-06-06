@@ -106,6 +106,7 @@ class GoogleMapsScraper:
                     if record and matches_website_filter(
                         record.get("website"), need_website
                     ):
+                        record["search_query"] = search_query
                         record["rank_position"] = rank_position
                         record["seo_opportunity"] = compute_seo_opportunity(
                             rank_position

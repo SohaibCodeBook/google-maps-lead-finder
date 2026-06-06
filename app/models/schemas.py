@@ -6,7 +6,14 @@ SCRAPABLE_FIELDS = frozenset(
     {"name", "phone", "website", "address", "rating", "reviews", "category"}
 )
 ALWAYS_INCLUDED_FIELDS = frozenset(
-    {"keyword", "city", "maps_url", "rank_position", "seo_opportunity"}
+    {
+        "keyword",
+        "city",
+        "search_query",
+        "maps_url",
+        "rank_position",
+        "seo_opportunity",
+    }
 )
 
 
