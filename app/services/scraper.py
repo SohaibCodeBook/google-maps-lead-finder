@@ -9,6 +9,7 @@ from playwright.async_api import Browser, Page, async_playwright
 
 from app.core.config import settings
 from app.services.filters import matches_website_filter
+from app.services.seo import compute_seo_opportunity
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +90,9 @@ class GoogleMapsScraper:
                 if need_website is None
                 else min(100, max(max_results * 5, max_results))
             )
-            listing_urls = await self._collect_listing_urls(page, url_limit)
+            listing_entries = await self._collect_listing_urls(page, url_limit)
 
-            for index, maps_url in enumerate(listing_urls):
+            for maps_url, rank_position in listing_entries:
                 if len(results) >= max_results:
                     break
                 try:
@@ -105,11 +106,15 @@ class GoogleMapsScraper:
                     if record and matches_website_filter(
                         record.get("website"), need_website
                     ):
+                        record["rank_position"] = rank_position
+                        record["seo_opportunity"] = compute_seo_opportunity(
+                            rank_position
+                        )
                         results.append(record)
                 except Exception as exc:
                     logger.warning(
-                        "Skipping listing %d for '%s': %s",
-                        index + 1,
+                        "Skipping listing rank %d for '%s': %s",
+                        rank_position,
                         search_query,
                         exc,
                     )
@@ -180,39 +185,46 @@ class GoogleMapsScraper:
                 continue
         raise RuntimeError("Could not find Google Maps search input")
 
-    async def _collect_listing_urls(self, page: Page, max_results: int) -> list[str]:
+    async def _collect_listing_urls(
+        self, page: Page, max_results: int
+    ) -> list[tuple[str, int]]:
+        ordered_urls: list[str] = []
         seen: set[str] = set()
         stale_rounds = 0
 
-        while len(seen) < max_results and stale_rounds < 5:
+        while len(ordered_urls) < max_results and stale_rounds < 5:
             links = page.locator(self.LISTING_LINK_SELECTOR)
             count = await links.count()
 
             for i in range(count):
-                if len(seen) >= max_results:
+                if len(ordered_urls) >= max_results:
                     break
                 href = await links.nth(i).get_attribute("href")
                 if href and href not in seen:
                     seen.add(href)
+                    ordered_urls.append(href)
 
-            if len(seen) >= max_results:
+            if len(ordered_urls) >= max_results:
                 break
 
             end_visible = await page.locator(self.END_OF_LIST_SELECTOR).count()
             if end_visible > 0:
                 break
 
-            previous_count = len(seen)
+            previous_count = len(ordered_urls)
             feed = page.locator(self.FEED_SELECTOR)
             await feed.evaluate("el => el.scrollTop = el.scrollHeight")
             await self._random_delay(1.0, 2.0)
 
-            if len(seen) == previous_count:
+            if len(ordered_urls) == previous_count:
                 stale_rounds += 1
             else:
                 stale_rounds = 0
 
-        return list(seen)[:max_results]
+        return [
+            (url, rank)
+            for rank, url in enumerate(ordered_urls[:max_results], start=1)
+        ]
 
     async def _scrape_listing(
         self,

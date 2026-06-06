@@ -5,7 +5,9 @@ from pydantic import BaseModel, Field, field_validator
 SCRAPABLE_FIELDS = frozenset(
     {"name", "phone", "website", "address", "rating", "reviews", "category"}
 )
-ALWAYS_INCLUDED_FIELDS = frozenset({"keyword", "city", "maps_url"})
+ALWAYS_INCLUDED_FIELDS = frozenset(
+    {"keyword", "city", "maps_url", "rank_position", "seo_opportunity"}
+)
 
 
 class ScrapeRequest(BaseModel):
