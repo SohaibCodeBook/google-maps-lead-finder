@@ -19,6 +19,7 @@ async def scrape(request: ScrapeRequest) -> ScrapeResponse:
             fields=request.fields,
             max_results_per_search=request.max_results_per_search,
             need_website=request.need_website,
+            min_rank=request.min_rank,
         )
     except Exception as exc:
         logger.exception("Scrape request failed")

@@ -17,6 +17,7 @@ class ScrapeOrchestrator:
         fields: list[str],
         max_results_per_search: int,
         need_website: bool | None = None,
+        min_rank: int | None = None,
     ) -> list[dict[str, Any]]:
         requested_fields = set(fields)
         all_results: list[dict[str, Any]] = []
@@ -44,6 +45,7 @@ class ScrapeOrchestrator:
                             fields=requested_fields,
                             max_results=max_results_per_search,
                             need_website=need_website,
+                            min_rank=min_rank,
                         )
                         filtered = [
                             filter_record(record, requested_fields) for record in batch

@@ -73,6 +73,7 @@ class GoogleMapsScraper:
         fields: set[str],
         max_results: int,
         need_website: bool | None = None,
+        min_rank: int | None = None,
     ) -> list[dict[str, Any]]:
         if not self._browser:
             raise RuntimeError("Scraper must be used as an async context manager")
@@ -106,6 +107,7 @@ class GoogleMapsScraper:
                 fields=extract_fields,
                 max_results=max_results,
                 need_website=need_website,
+                min_rank=min_rank,
             )
         except Exception as exc:
             logger.error("Search failed for '%s': %s", search_query, exc)
@@ -124,6 +126,7 @@ class GoogleMapsScraper:
         fields: set[str],
         max_results: int,
         need_website: bool | None,
+        min_rank: int | None = None,
     ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         url_ranks: dict[str, int] = {}
@@ -143,6 +146,7 @@ class GoogleMapsScraper:
                 visited=visited,
                 results=results,
                 max_results=max_results,
+                min_rank=min_rank,
             )
 
             if len(results) >= max_results:
@@ -193,6 +197,7 @@ class GoogleMapsScraper:
         visited: set[str],
         results: list[dict[str, Any]],
         max_results: int,
+        min_rank: int | None = None,
     ) -> int:
         """Snapshot feed, assign ranks, scrape unvisited listings. Returns count processed."""
         processed = 0
@@ -222,6 +227,10 @@ class GoogleMapsScraper:
 
             visited.add(href)
             processed += 1
+
+            if min_rank is not None and rank_position < min_rank:
+                continue
+
             try:
                 record = await self._scrape_listing(
                     page=detail_page,

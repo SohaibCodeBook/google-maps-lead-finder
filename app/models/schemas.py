@@ -31,6 +31,11 @@ class ScrapeRequest(BaseModel):
             "omit = no filter"
         ),
     )
+    min_rank: int | None = Field(
+        default=None,
+        ge=1,
+        description="Skip listings ranked below this position (without opening detail page)",
+    )
 
     @field_validator("keywords", "cities")
     @classmethod
