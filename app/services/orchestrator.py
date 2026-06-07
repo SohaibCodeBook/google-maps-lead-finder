@@ -1,7 +1,7 @@
 import logging
 from typing import Any
 
-from app.services.filters import filter_record
+from app.services.filters import filter_record, output_fields_for_request
 from app.services.scraper import GoogleMapsScraper
 
 logger = logging.getLogger(__name__)
@@ -47,8 +47,11 @@ class ScrapeOrchestrator:
                             need_website=need_website,
                             min_rank=min_rank,
                         )
+                        response_fields = output_fields_for_request(
+                            requested_fields, need_website
+                        )
                         filtered = [
-                            filter_record(record, requested_fields) for record in batch
+                            filter_record(record, response_fields) for record in batch
                         ]
                         all_results.extend(filtered)
                     except Exception as exc:

@@ -4,7 +4,7 @@ import random
 import re
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from playwright.async_api import Browser, Page, async_playwright
 
@@ -400,8 +400,8 @@ class GoogleMapsScraper:
         )
         await self._random_delay(0.8, 1.5)
 
-        await page.locator("h1").first.wait_for(
-            state="visible",
+        await page.locator("h1.DUwDvf, h1").first.wait_for(
+            state="attached",
             timeout=settings.page_timeout_ms,
         )
         try:
@@ -471,7 +471,41 @@ class GoogleMapsScraper:
                     return text
         return None
 
+    def _normalize_website_url(self, href: str | None) -> str | None:
+        if not href or not href.strip():
+            return None
+        href = href.strip()
+        if "google.com/url" in href:
+            query = parse_qs(urlparse(href).query).get("q", [None])[0]
+            return unquote(query) if query else None
+        if href.startswith("http"):
+            return href
+        return None
+
     async def _extract_website(self, page: Page) -> str | None:
+        try:
+            await page.locator('a[data-item-id="authority"]').first.wait_for(
+                state="attached",
+                timeout=5000,
+            )
+        except Exception:
+            pass
+
+        href = await page.evaluate(
+            """
+            () => {
+                const el =
+                    document.querySelector('a[data-item-id="authority"]') ||
+                    document.querySelector('a[aria-label*="Website"]') ||
+                    document.querySelector('a[data-tooltip="Open website"]');
+                return el ? el.href : null;
+            }
+            """
+        )
+        normalized = self._normalize_website_url(href)
+        if normalized:
+            return normalized
+
         selectors = [
             'a[data-item-id="authority"]',
             'a[aria-label*="Website"]',
@@ -480,9 +514,10 @@ class GoogleMapsScraper:
         for selector in selectors:
             locator = page.locator(selector).first
             if await locator.count() > 0:
-                href = await locator.get_attribute("href")
-                if href and href.startswith("http"):
-                    return href
+                link_href = await locator.get_attribute("href")
+                normalized = self._normalize_website_url(link_href)
+                if normalized:
+                    return normalized
         return None
 
     async def _extract_address(self, page: Page) -> str | None:
