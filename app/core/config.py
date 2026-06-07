@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     navigation_timeout_ms: int = 60_000
     headless: bool = True
     google_maps_url: str = "https://www.google.com/maps"
+    results_settle_seconds: float = 2.5
+    scroll_settle_seconds: float = 1.5
+    results_settle_poll_ms: float = 500
+    results_ready_timeout_ms: int = 20_000
 
 
 settings = Settings()

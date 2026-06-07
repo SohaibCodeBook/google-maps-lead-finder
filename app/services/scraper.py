@@ -2,6 +2,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -25,6 +26,15 @@ class GoogleMapsScraper:
     FEED_SELECTOR = 'div[role="feed"]'
     LISTING_LINK_SELECTOR = 'div[role="feed"] a.hfpxzc'
     END_OF_LIST_SELECTOR = 'span:has-text("You\'ve reached the end of the list")'
+    MAX_STALE_SCROLL_ROUNDS = 5
+    _IS_SPONSORED_JS = """
+        (el) => {
+            if (el.closest('[data-is-ad]') || el.closest('.sponsoredResult')) return true;
+            const container = el.closest('[role="article"]') || el.closest('div[jsaction]');
+            if (!container) return false;
+            return /\\bSponsored\\b/i.test(container.innerText);
+        }
+    """
     CONSENT_BUTTON_SELECTORS = [
         'button:has-text("Accept all")',
         'button:has-text("Reject all")',
@@ -78,48 +88,25 @@ class GoogleMapsScraper:
         await context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
         )
-        page = await context.new_page()
-        page.set_default_timeout(settings.page_timeout_ms)
+        search_page = await context.new_page()
+        search_page.set_default_timeout(settings.page_timeout_ms)
+        detail_page = await context.new_page()
+        detail_page.set_default_timeout(settings.page_timeout_ms)
 
         results: list[dict[str, Any]] = []
 
         try:
-            await self._navigate_and_search(page, search_query)
-            url_limit = (
-                max_results
-                if need_website is None
-                else min(100, max(max_results * 5, max_results))
+            await self._navigate_and_search(search_page, search_query)
+            results = await self._scroll_filter_and_scrape(
+                search_page=search_page,
+                detail_page=detail_page,
+                search_query=search_query,
+                keyword=keyword,
+                city=city,
+                fields=extract_fields,
+                max_results=max_results,
+                need_website=need_website,
             )
-            listing_entries = await self._collect_listing_urls(page, url_limit)
-
-            for maps_url, rank_position in listing_entries:
-                if len(results) >= max_results:
-                    break
-                try:
-                    record = await self._scrape_listing(
-                        page=page,
-                        maps_url=maps_url,
-                        keyword=keyword,
-                        city=city,
-                        fields=extract_fields,
-                    )
-                    if record and matches_website_filter(
-                        record.get("website"), need_website
-                    ):
-                        record["search_query"] = search_query
-                        record["rank_position"] = rank_position
-                        record["seo_opportunity"] = compute_seo_opportunity(
-                            rank_position
-                        )
-                        results.append(record)
-                except Exception as exc:
-                    logger.warning(
-                        "Skipping listing rank %d for '%s': %s",
-                        rank_position,
-                        search_query,
-                        exc,
-                    )
-                await self._random_delay()
         except Exception as exc:
             logger.error("Search failed for '%s': %s", search_query, exc)
         finally:
@@ -127,14 +114,168 @@ class GoogleMapsScraper:
 
         return results
 
+    async def _scroll_filter_and_scrape(
+        self,
+        search_page: Page,
+        detail_page: Page,
+        search_query: str,
+        keyword: str,
+        city: str,
+        fields: set[str],
+        max_results: int,
+        need_website: bool | None,
+    ) -> list[dict[str, Any]]:
+        results: list[dict[str, Any]] = []
+        url_ranks: dict[str, int] = {}
+        visited: set[str] = set()
+        stale_rounds = 0
+
+        while len(results) < max_results:
+            processed_this_round = await self._process_visible_listings(
+                search_page=search_page,
+                detail_page=detail_page,
+                search_query=search_query,
+                keyword=keyword,
+                city=city,
+                fields=fields,
+                need_website=need_website,
+                url_ranks=url_ranks,
+                visited=visited,
+                results=results,
+                max_results=max_results,
+            )
+
+            if len(results) >= max_results:
+                logger.info(
+                    "Reached max_results (%d) for '%s'",
+                    max_results,
+                    search_query,
+                )
+                break
+
+            if await search_page.locator(self.END_OF_LIST_SELECTOR).count() > 0:
+                logger.info(
+                    "End of Maps list for '%s' with %d matching results",
+                    search_query,
+                    len(results),
+                )
+                break
+
+            organic_before = await self._count_organic_hrefs_in_feed(search_page)
+            await self._scroll_feed(search_page)
+            organic_after = await self._count_organic_hrefs_in_feed(search_page)
+
+            if organic_after <= organic_before and processed_this_round == 0:
+                stale_rounds += 1
+                if stale_rounds >= self.MAX_STALE_SCROLL_ROUNDS:
+                    logger.info(
+                        "No new listings after %d scrolls for '%s' (%d matching)",
+                        stale_rounds,
+                        search_query,
+                        len(results),
+                    )
+                    break
+            else:
+                stale_rounds = 0
+
+        return results
+
+    async def _process_visible_listings(
+        self,
+        search_page: Page,
+        detail_page: Page,
+        search_query: str,
+        keyword: str,
+        city: str,
+        fields: set[str],
+        need_website: bool | None,
+        url_ranks: dict[str, int],
+        visited: set[str],
+        results: list[dict[str, Any]],
+        max_results: int,
+    ) -> int:
+        """Snapshot feed, assign ranks, scrape unvisited listings. Returns count processed."""
+        processed = 0
+        pending: list[tuple[str, int]] = []
+        all_links = await search_page.locator(self.LISTING_LINK_SELECTOR).all()
+
+        for link in all_links:
+            try:
+                if await self._is_sponsored_listing(link):
+                    continue
+                href = await link.get_attribute("href")
+                if not href:
+                    continue
+                if href not in url_ranks:
+                    url_ranks[href] = len(url_ranks) + 1
+                if href in visited:
+                    continue
+                pending.append((href, url_ranks[href]))
+            except Exception as exc:
+                logger.debug("Skipping link while reading feed: %s", exc)
+
+        pending.sort(key=lambda item: item[1])
+
+        for href, rank_position in pending:
+            if len(results) >= max_results:
+                break
+
+            visited.add(href)
+            processed += 1
+            try:
+                record = await self._scrape_listing(
+                    page=detail_page,
+                    maps_url=href,
+                    keyword=keyword,
+                    city=city,
+                    fields=fields,
+                )
+                if record and matches_website_filter(
+                    record.get("website"), need_website
+                ):
+                    record["search_query"] = search_query
+                    record["rank_position"] = rank_position
+                    record["seo_opportunity"] = compute_seo_opportunity(
+                        rank_position
+                    )
+                    results.append(record)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping listing rank %d for '%s': %s",
+                    rank_position,
+                    search_query,
+                    exc,
+                )
+            await self._random_delay()
+
+        return processed
+
+    async def _count_organic_hrefs_in_feed(self, page: Page) -> int:
+        all_links = await page.locator(self.LISTING_LINK_SELECTOR).all()
+        seen: set[str] = set()
+        for link in all_links:
+            try:
+                if await self._is_sponsored_listing(link):
+                    continue
+                href = await link.get_attribute("href")
+                if href:
+                    seen.add(href)
+            except Exception:
+                continue
+        return len(seen)
+
+    async def _scroll_feed(self, page: Page) -> None:
+        feed = page.locator(self.FEED_SELECTOR)
+        await feed.evaluate("el => el.scrollTop = el.scrollHeight")
+        await self._random_delay(1.0, 2.0)
+
     async def _navigate_and_search(self, page: Page, search_query: str) -> None:
         search_url = f"{settings.google_maps_url}/search/{quote(search_query)}"
         await page.goto(
             search_url,
-            wait_until="domcontentloaded",
+            wait_until="load",
             timeout=settings.navigation_timeout_ms,
         )
-        await self._random_delay(0.5, 1.5)
         await self._dismiss_consent_if_present(page)
 
         try:
@@ -150,7 +291,53 @@ class GoogleMapsScraper:
                 timeout=settings.page_timeout_ms,
             )
 
-        await self._random_delay()
+        await self._wait_for_results_settled(page)
+        logger.info(
+            "Search results ready for '%s' (%d organic listings visible)",
+            search_query,
+            await self._count_organic_hrefs_in_feed(page),
+        )
+
+    async def _wait_for_results_settled(
+        self,
+        page: Page,
+        settle_seconds: float | None = None,
+        timeout_ms: int | None = None,
+    ) -> None:
+        settle = settle_seconds or settings.results_settle_seconds
+        timeout = timeout_ms or settings.results_ready_timeout_ms
+        poll = settings.results_settle_poll_ms / 1000
+        required_stable = max(1, int(settle / poll))
+        deadline = time.monotonic() + (timeout / 1000)
+
+        try:
+            await page.locator(self.LISTING_LINK_SELECTOR).first.wait_for(
+                state="attached",
+                timeout=min(timeout, settings.page_timeout_ms),
+            )
+        except Exception:
+            logger.warning("No listing links appeared in results feed")
+            return
+
+        stable_polls = 0
+        last_organic = -1
+
+        while time.monotonic() < deadline:
+            organic = await self._count_organic_hrefs_in_feed(page)
+            if organic > 0 and organic == last_organic:
+                stable_polls += 1
+                if stable_polls >= required_stable:
+                    return
+            else:
+                stable_polls = 0
+                last_organic = organic
+            await asyncio.sleep(poll)
+
+        logger.info(
+            "Proceeding after settle timeout (%dms, %d organic listings)",
+            timeout,
+            max(last_organic, 0),
+        )
 
     async def _dismiss_consent_if_present(self, page: Page) -> None:
         for selector in self.CONSENT_BUTTON_SELECTORS:
@@ -167,7 +354,7 @@ class GoogleMapsScraper:
         if "google.com/maps" not in page.url:
             await page.goto(
                 settings.google_maps_url,
-                wait_until="domcontentloaded",
+                wait_until="load",
                 timeout=settings.navigation_timeout_ms,
             )
             await self._dismiss_consent_if_present(page)
@@ -186,46 +373,8 @@ class GoogleMapsScraper:
                 continue
         raise RuntimeError("Could not find Google Maps search input")
 
-    async def _collect_listing_urls(
-        self, page: Page, max_results: int
-    ) -> list[tuple[str, int]]:
-        ordered_urls: list[str] = []
-        seen: set[str] = set()
-        stale_rounds = 0
-
-        while len(ordered_urls) < max_results and stale_rounds < 5:
-            links = page.locator(self.LISTING_LINK_SELECTOR)
-            count = await links.count()
-
-            for i in range(count):
-                if len(ordered_urls) >= max_results:
-                    break
-                href = await links.nth(i).get_attribute("href")
-                if href and href not in seen:
-                    seen.add(href)
-                    ordered_urls.append(href)
-
-            if len(ordered_urls) >= max_results:
-                break
-
-            end_visible = await page.locator(self.END_OF_LIST_SELECTOR).count()
-            if end_visible > 0:
-                break
-
-            previous_count = len(ordered_urls)
-            feed = page.locator(self.FEED_SELECTOR)
-            await feed.evaluate("el => el.scrollTop = el.scrollHeight")
-            await self._random_delay(1.0, 2.0)
-
-            if len(ordered_urls) == previous_count:
-                stale_rounds += 1
-            else:
-                stale_rounds = 0
-
-        return [
-            (url, rank)
-            for rank, url in enumerate(ordered_urls[:max_results], start=1)
-        ]
+    async def _is_sponsored_listing(self, link) -> bool:
+        return await link.evaluate(self._IS_SPONSORED_JS)
 
     async def _scrape_listing(
         self,
@@ -237,7 +386,7 @@ class GoogleMapsScraper:
     ) -> dict[str, Any] | None:
         await page.goto(
             maps_url,
-            wait_until="domcontentloaded",
+            wait_until="load",
             timeout=settings.navigation_timeout_ms,
         )
         await self._random_delay(0.8, 1.5)
@@ -246,6 +395,10 @@ class GoogleMapsScraper:
             state="visible",
             timeout=settings.page_timeout_ms,
         )
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
 
         raw: dict[str, Any] = {
             "keyword": keyword,
